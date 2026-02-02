@@ -4,6 +4,11 @@ Streamlit chatbot UI for the LangChain agent with MCP tools.
 
 import streamlit as st
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
 # Page configuration
 st.set_page_config(
     page_title="MCP Agent Chatbot",
@@ -69,16 +74,8 @@ if prompt := st.chat_input("Ask me anything..."):
 # Sidebar with info
 with st.sidebar:
     st.text_input("MCP URL", value=os.getenv("MCP_URL", "https://devws.vigilnz.com/sse"))
-    st.text_input("VIGILNZ API KEY", value=os.getenv("VIGIL_API_KEY", ""))
+    st.text_input("VIGILNZ API KEY", value=os.getenv("VIGILNZ_API_KEY"), type="password")
     st.header("Controls")
     if st.button("Clear Chat History"):
         st.session_state.messages = []
-        st.rerun()
-    
-    st.header("Status")
-    st.info("Make sure the MCP server is running at `localhost:3001`")
-    if st.button("Reconnect MCP"):
-        st.session_state.agent_llm = None
-        st.session_state.agent_tools = None
-        st.session_state.agent_tool_map = None
         st.rerun()
