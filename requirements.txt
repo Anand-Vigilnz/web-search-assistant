@@ -1,0 +1,12 @@
+# Dependencies for web_agent app
+# Note: Most dependencies are managed in parent pyproject.toml
+# This file lists the key dependencies for reference
+
+streamlit>=1.28.0
+langchain>=0.1.0
+langchain-core>=0.1.0
+langchain-openai>=0.2.0
+mcp>=0.1.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+nest-asyncio>=1.6.0
