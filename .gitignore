@@ -9,3 +9,4 @@ wheels/
 # Virtual environments
 .venv
 .env
+atlassian_mcp_client.py

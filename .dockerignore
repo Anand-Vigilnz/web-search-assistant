@@ -1,0 +1,24 @@
+# Environment and secrets - pass at runtime
+.env
+.env.*
+
+# Git
+.git
+.gitignore
+atlassian_mcp_client.py
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+.venv
+venv
+*.egg-info
+
+# IDE and tools
+.cursor
+.vscode
+.python-version
+
+# UV / packaging (not needed in container)
+pyproject.toml
+uv.lock
