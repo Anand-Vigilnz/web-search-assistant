@@ -68,8 +68,8 @@ if prompt := st.chat_input("Ask me anything..."):
 
 # Sidebar with info
 with st.sidebar:
-    st.input_text("MCP URL", value=os.getenv("MCP_URL", "https://devws.vigilnz.com/sse"))
-    st.input_text("VIGILNZ API KEY", value=os.getenv("VIGIL_API_KEY", ""))
+    st.text_input("MCP URL", value=os.getenv("MCP_URL", "https://devws.vigilnz.com/sse"))
+    st.text_input("VIGILNZ API KEY", value=os.getenv("VIGIL_API_KEY", ""))
     st.header("Controls")
     if st.button("Clear Chat History"):
         st.session_state.messages = []
