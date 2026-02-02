@@ -18,8 +18,14 @@ _cached_tools: Optional[List] = None
 _cached_tool_map: Optional[Dict[str, Any]] = None
 
 
-def get_llm_and_tools(force_recreate: bool = False):
-    """Get or create LLM and tools."""
+def get_llm_and_tools(
+    force_recreate: bool = False,
+    openai_api_key: Optional[str] = None,
+    mcp_url: Optional[str] = None,
+    vigilnz_api_key: Optional[str] = None,
+):
+    """Get or create LLM and tools.
+    Config priority: passed params > .env > defaults."""
     global _cached_llm, _cached_tools, _cached_tool_map
 
     if _cached_llm is not None and not force_recreate:
@@ -29,19 +35,21 @@ def get_llm_and_tools(force_recreate: bool = False):
     from langchain_openai import ChatOpenAI
     from mcp_tools import get_langchain_tools_sync
 
-    # Initialize LLM
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        raise ValueError("OPENAI_API_KEY environment variable is not set")
+    # Initialize LLM - priority: param > .env
+    resolved_openai_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+    if not resolved_openai_key:
+        raise ValueError(
+            "OPENAI_API_KEY is required. Set it in the UI sidebar, or in .env, or as OPENAI_API_KEY env var."
+        )
 
     llm = ChatOpenAI(
         model="gpt-4o-mini",
-        api_key=openai_api_key,
+        api_key=resolved_openai_key,
         temperature=0.7,
     )
 
-    # Get MCP tools wrapped as LangChain tools
-    tools = get_langchain_tools_sync()
+    # Get MCP tools wrapped as LangChain tools - priority: param > .env > defaults
+    tools = get_langchain_tools_sync(mcp_url=mcp_url, api_key=vigilnz_api_key)
 
     if not tools:
         raise ValueError("No MCP tools available. Make sure the MCP server is running.")

@@ -22,15 +22,22 @@ nest_asyncio.apply()
 # Load environment variables
 load_dotenv()
 
-# MCP connection configuration
-MCP_URL = os.getenv("MCP_URL", "https://devws.vigilnz.com/sse")
-MCP_API_KEY = os.getenv("VIGIL_API_KEY", "")
+# Default MCP connection configuration (env > defaults)
+def _get_default_mcp_url() -> str:
+    return os.getenv("MCP_URL", "https://devws.vigilnz.com/sse")
+
+
+def _get_default_mcp_api_key() -> str:
+    return os.getenv("VIGILNZ_API_KEY") or os.getenv("VIGIL_API_KEY") or ""
+
 
 # Global session storage (accessed only from worker thread's event loop)
 _session: Optional[ClientSession] = None
 _read_stream = None
 _write_stream = None
 _stream_context = None
+_session_mcp_url: Optional[str] = None
+_session_api_key: Optional[str] = None
 
 # Dedicated worker thread and loop for MCP so cleanup always runs in async context
 _mcp_loop_ref: List[Optional[asyncio.AbstractEventLoop]] = [None]
@@ -67,15 +74,26 @@ def _run_on_mcp_loop(coro):
     return future.result(timeout=120)
 
 
-async def get_mcp_session() -> ClientSession:
+async def get_mcp_session(mcp_url: Optional[str] = None, api_key: Optional[str] = None) -> ClientSession:
     """Get or create a long-lived MCP session."""
-    global _session, _read_stream, _write_stream, _stream_context
-    
+    global _session, _read_stream, _write_stream, _stream_context, _session_mcp_url, _session_api_key
+
+    url = mcp_url if mcp_url is not None else _get_default_mcp_url()
+    key = api_key if api_key is not None else _get_default_mcp_api_key()
+
+    # Reset session if config changed
+    if _session is not None and (_session_mcp_url != url or _session_api_key != key):
+        await close_session()
+        _session_mcp_url = None
+        _session_api_key = None
+
     if _session is None:
+        _session_mcp_url = url
+        _session_api_key = key
         headers = {
-            "X-API-Key": MCP_API_KEY,
+            "X-API-Key": key,
         }
-        _stream_context = streamablehttp_client(MCP_URL, headers=headers)
+        _stream_context = streamablehttp_client(url, headers=headers)
         _read_stream, _write_stream, _ = await _stream_context.__aenter__()
         _session = ClientSession(_read_stream, _write_stream)
         await _session.__aenter__()
@@ -84,9 +102,9 @@ async def get_mcp_session() -> ClientSession:
     return _session
 
 
-async def list_mcp_tools():
+async def list_mcp_tools(mcp_url: Optional[str] = None, api_key: Optional[str] = None):
     """List all available MCP tools."""
-    session = await get_mcp_session()
+    session = await get_mcp_session(mcp_url=mcp_url, api_key=api_key)
     tools_result = await session.list_tools()
     return tools_result.tools
 
@@ -207,9 +225,9 @@ async def _call_tool_and_close(tool_name: str, arguments: Dict[str, Any]) -> str
         await close_session()
 
 
-async def get_langchain_tools() -> List[StructuredTool]:
+async def get_langchain_tools(mcp_url: Optional[str] = None, api_key: Optional[str] = None) -> List[StructuredTool]:
     """Get all MCP tools wrapped as LangChain tools."""
-    mcp_tools = await list_mcp_tools()
+    mcp_tools = await list_mcp_tools(mcp_url=mcp_url, api_key=api_key)
     langchain_tools = []
     
     for mcp_tool in mcp_tools:
@@ -225,18 +243,26 @@ async def get_langchain_tools() -> List[StructuredTool]:
 
 def _reset_mcp_session():
     """Reset global MCP session so next call creates a fresh connection."""
-    global _session, _stream_context, _read_stream, _write_stream
+    global _session, _stream_context, _read_stream, _write_stream, _session_mcp_url, _session_api_key
     _session = None
     _stream_context = None
     _read_stream = None
     _write_stream = None
+    _session_mcp_url = None
+    _session_api_key = None
 
 
-def get_langchain_tools_sync() -> List[StructuredTool]:
-    """Synchronous wrapper to get LangChain tools. Runs on MCP worker loop so cleanup sees async context."""
+def get_langchain_tools_sync(
+    mcp_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> List[StructuredTool]:
+    """Synchronous wrapper to get LangChain tools. Runs on MCP worker loop so cleanup sees async context.
+    Config priority: passed params > .env > defaults."""
+    resolved_url = mcp_url if mcp_url is not None else _get_default_mcp_url()
+
     async def _fetch_and_close() -> List[StructuredTool]:
         try:
-            return await get_langchain_tools()
+            return await get_langchain_tools(mcp_url=mcp_url, api_key=api_key)
         finally:
             await close_session()
 
@@ -249,7 +275,7 @@ def get_langchain_tools_sync() -> List[StructuredTool]:
                 continue
             raise ValueError(
                 "MCP connection was cancelled. Make sure the MCP server is running at "
-                f"{MCP_URL} and try again."
+                f"{resolved_url} and try again."
             )
         except Exception as e:
             if "WouldBlock" in type(e).__name__ or "EndOfStream" in type(e).__name__:
@@ -257,12 +283,12 @@ def get_langchain_tools_sync() -> List[StructuredTool]:
                 if attempt == 0:
                     continue
             raise ValueError(
-                f"Failed to connect to MCP server at {MCP_URL}: {e}. "
+                f"Failed to connect to MCP server at {resolved_url}: {e}. "
                 "Ensure the MCP server is running and reachable."
             ) from e
 
     raise ValueError(
-        f"Could not load MCP tools after retry. Is the MCP server running at {MCP_URL}?"
+        f"Could not load MCP tools after retry. Is the MCP server running at {resolved_url}?"
     )
 
 
