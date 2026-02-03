@@ -218,11 +218,8 @@ async def _call_mcp_tool_async(tool_name: str, arguments: Dict[str, Any]) -> str
 
 
 async def _call_tool_and_close(tool_name: str, arguments: Dict[str, Any]) -> str:
-    """Call MCP tool then close session so cleanup runs inside the same event loop."""
-    try:
-        return await _call_mcp_tool_async(tool_name, arguments)
-    finally:
-        await close_session()
+    """Call MCP tool. Session is kept open to avoid anyio TaskGroup teardown bugs on every call."""
+    return await _call_mcp_tool_async(tool_name, arguments)
 
 
 async def get_langchain_tools(mcp_url: Optional[str] = None, api_key: Optional[str] = None) -> List[StructuredTool]:
@@ -260,15 +257,12 @@ def get_langchain_tools_sync(
     Config priority: passed params > .env > defaults."""
     resolved_url = mcp_url if mcp_url is not None else _get_default_mcp_url()
 
-    async def _fetch_and_close() -> List[StructuredTool]:
-        try:
-            return await get_langchain_tools(mcp_url=mcp_url, api_key=api_key)
-        finally:
-            await close_session()
+    async def _fetch_tools() -> List[StructuredTool]:
+        return await get_langchain_tools(mcp_url=mcp_url, api_key=api_key)
 
     for attempt in range(2):
         try:
-            return _run_on_mcp_loop(_fetch_and_close())
+            return _run_on_mcp_loop(_fetch_tools())
         except asyncio.CancelledError:
             _reset_mcp_session()
             if attempt == 0:
@@ -278,7 +272,12 @@ def get_langchain_tools_sync(
                 f"{resolved_url} and try again."
             )
         except Exception as e:
-            if "WouldBlock" in type(e).__name__ or "EndOfStream" in type(e).__name__:
+            err_msg = str(e)
+            if (
+                "WouldBlock" in type(e).__name__
+                or "EndOfStream" in type(e).__name__
+                or "_exceptions" in err_msg
+            ):
                 _reset_mcp_session()
                 if attempt == 0:
                     continue
@@ -293,13 +292,23 @@ def get_langchain_tools_sync(
 
 
 async def close_session():
-    """Close the MCP session and stream context while event loop is still running (avoids AsyncLibraryNotFoundError on teardown)."""
+    """Close the MCP session and stream context while event loop is still running (avoids AsyncLibraryNotFoundError on teardown).
+    Catches anyio/asyncio TaskGroup '_exceptions' AttributeError during teardown and still clears state."""
     global _session, _stream_context, _read_stream, _write_stream
-    if _session:
-        await _session.__aexit__(None, None, None)
-        _session = None
-    if _stream_context:
-        await _stream_context.__aexit__(None, None, None)
-        _stream_context = None
-    _read_stream = None
-    _write_stream = None
+    try:
+        if _session:
+            await _session.__aexit__(None, None, None)
+            _session = None
+        if _stream_context:
+            await _stream_context.__aexit__(None, None, None)
+            _stream_context = None
+    except AttributeError as e:
+        # anyio asyncio backend bug: TaskGroup has no attribute '_exceptions' during __aexit__
+        if "_exceptions" in str(e):
+            _session = None
+            _stream_context = None
+        else:
+            raise
+    finally:
+        _read_stream = None
+        _write_stream = None

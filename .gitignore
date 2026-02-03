@@ -5,7 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
-
+simple_mcp_client.py
 # Virtual environments
 .venv
 .env
