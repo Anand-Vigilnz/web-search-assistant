@@ -13,6 +13,7 @@ from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.sse import sse_client
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
@@ -93,11 +94,46 @@ async def get_mcp_session(mcp_url: Optional[str] = None, api_key: Optional[str] 
         headers = {
             "X-API-Key": key,
         }
-        _stream_context = streamablehttp_client(url, headers=headers)
-        _read_stream, _write_stream, _ = await _stream_context.__aenter__()
-        _session = ClientSession(_read_stream, _write_stream)
-        await _session.__aenter__()
-        await _session.initialize()
+        
+        # Try SSE client first for /sse endpoints, then fall back to streamable HTTP
+        use_sse = url.rstrip('/').endswith('/sse')
+        clients_to_try = [sse_client, streamablehttp_client] if use_sse else [streamablehttp_client, sse_client]
+        last_error = None
+        
+        for client_factory in clients_to_try:
+            try:
+                _stream_context = client_factory(url, headers=headers)
+                _read_stream, _write_stream, _ = await _stream_context.__aenter__()
+                _session = ClientSession(_read_stream, _write_stream)
+                await _session.__aenter__()
+                await _session.initialize()
+                return _session
+            except Exception as e:
+                last_error = e
+                # Clean up partial state before trying next client
+                if _session:
+                    try:
+                        await _session.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                if _stream_context:
+                    try:
+                        await _stream_context.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                _session = None
+                _stream_context = None
+                _read_stream = None
+                _write_stream = None
+                # Continue to try next client
+                continue
+        
+        # All clients failed - reset state and raise last error
+        _session_mcp_url = None
+        _session_api_key = None
+        if last_error:
+            raise last_error
+        raise RuntimeError("Failed to connect with any MCP transport")
     
     return _session
 
@@ -260,26 +296,39 @@ def get_langchain_tools_sync(
     async def _fetch_tools() -> List[StructuredTool]:
         return await get_langchain_tools(mcp_url=mcp_url, api_key=api_key)
 
-    for attempt in range(2):
+    max_attempts = 3
+    last_error = None
+    for attempt in range(max_attempts):
         try:
             return _run_on_mcp_loop(_fetch_tools())
         except asyncio.CancelledError:
             _reset_mcp_session()
-            if attempt == 0:
+            last_error = "cancelled"
+            if attempt < max_attempts - 1:
+                import time
+                time.sleep(0.5)
                 continue
             raise ValueError(
                 "MCP connection was cancelled. Make sure the MCP server is running at "
                 f"{resolved_url} and try again."
             )
         except Exception as e:
+            last_error = e
             err_msg = str(e)
-            if (
-                "WouldBlock" in type(e).__name__
-                or "EndOfStream" in type(e).__name__
+            err_type = type(e).__name__
+            # Known transient errors: retry with session reset
+            is_transient = (
+                "WouldBlock" in err_type
+                or "EndOfStream" in err_type
                 or "_exceptions" in err_msg
-            ):
+                or "TaskGroup" in err_msg
+                or isinstance(e, AttributeError)
+            )
+            if is_transient:
                 _reset_mcp_session()
-                if attempt == 0:
+                if attempt < max_attempts - 1:
+                    import time
+                    time.sleep(0.5)
                     continue
             raise ValueError(
                 f"Failed to connect to MCP server at {resolved_url}: {e}. "
@@ -287,7 +336,8 @@ def get_langchain_tools_sync(
             ) from e
 
     raise ValueError(
-        f"Could not load MCP tools after retry. Is the MCP server running at {resolved_url}?"
+        f"Could not load MCP tools after {max_attempts} attempts. Last error: {last_error}. "
+        f"Is the MCP server running at {resolved_url}?"
     )
 
 
