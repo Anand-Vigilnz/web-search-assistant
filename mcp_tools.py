@@ -1,24 +1,18 @@
 """
 MCP session management and LangChain tool wrappers.
-Consolidates logic from web-mcp-client.py into reusable MCP tools for LangChain.
-All MCP async work runs in a dedicated worker thread with a long-lived event loop
-so httpx/sniffio cleanup always sees an async context (fixes AsyncLibraryNotFoundError).
+Uses proper async context manager pattern to avoid anyio TaskGroup cross-task issues.
 """
 
 import os
 import asyncio
 import threading
-import nest_asyncio
 from typing import List, Optional, Dict, Any
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.sse import sse_client
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
-
-# Apply nest_asyncio for compatibility with Streamlit
-nest_asyncio.apply()
 
 # Load environment variables
 load_dotenv()
@@ -32,21 +26,13 @@ def _get_default_mcp_api_key() -> str:
     return os.getenv("VIGILNZ_API_KEY") or os.getenv("VIGIL_API_KEY") or ""
 
 
-# Global session storage (accessed only from worker thread's event loop)
-_session: Optional[ClientSession] = None
-_read_stream = None
-_write_stream = None
-_stream_context = None
-_session_mcp_url: Optional[str] = None
-_session_api_key: Optional[str] = None
-
-# Dedicated worker thread and loop for MCP so cleanup always runs in async context
+# Dedicated worker thread and loop for MCP
 _mcp_loop_ref: List[Optional[asyncio.AbstractEventLoop]] = [None]
 _mcp_lock = threading.Lock()
 
 
 def _mcp_worker(ready_event: threading.Event) -> None:
-    """Run a long-lived event loop in this thread. All MCP connect/use/close runs here."""
+    """Run a long-lived event loop in this thread."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _mcp_loop_ref[0] = loop
@@ -55,7 +41,7 @@ def _mcp_worker(ready_event: threading.Event) -> None:
 
 
 def _ensure_mcp_loop() -> asyncio.AbstractEventLoop:
-    """Start the MCP worker thread and return its event loop. Idempotent."""
+    """Start the MCP worker thread and return its event loop."""
     with _mcp_lock:
         if _mcp_loop_ref[0] is not None:
             return _mcp_loop_ref[0]
@@ -69,79 +55,63 @@ def _ensure_mcp_loop() -> asyncio.AbstractEventLoop:
 
 
 def _run_on_mcp_loop(coro):
-    """Run a coroutine on the MCP worker loop and return the result. Use from sync code."""
+    """Run a coroutine on the MCP worker loop and return the result."""
     loop = _ensure_mcp_loop()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result(timeout=120)
 
 
-async def get_mcp_session(mcp_url: Optional[str] = None, api_key: Optional[str] = None) -> ClientSession:
-    """Get or create a long-lived MCP session."""
-    global _session, _read_stream, _write_stream, _stream_context, _session_mcp_url, _session_api_key
-
+@asynccontextmanager
+async def mcp_session(mcp_url: Optional[str] = None, api_key: Optional[str] = None):
+    """Context manager for MCP session - ensures proper enter/exit in same task."""
     url = mcp_url if mcp_url is not None else _get_default_mcp_url()
     key = api_key if api_key is not None else _get_default_mcp_api_key()
-
-    # Reset session if config changed
-    if _session is not None and (_session_mcp_url != url or _session_api_key != key):
-        await close_session()
-        _session_mcp_url = None
-        _session_api_key = None
-
-    if _session is None:
-        _session_mcp_url = url
-        _session_api_key = key
-        headers = {
-            "X-API-Key": key,
-            "Accept": "text/event-stream",
-        }
-        
-        # Try SSE client for /sse endpoints, streamable HTTP otherwise
-        use_sse = url.rstrip('/').endswith('/sse')
-        
-        try:
-            if use_sse:
-                _stream_context = sse_client(url, headers=headers)
-            else:
-                _stream_context = streamablehttp_client(url, headers=headers)
-            _read_stream, _write_stream, _ = await _stream_context.__aenter__()
-            _session = ClientSession(_read_stream, _write_stream)
-            await _session.__aenter__()
-            await _session.initialize()
-        except Exception as e:
-            # Clean up partial state
-            if _session:
-                try:
-                    await _session.__aexit__(None, None, None)
-                except Exception:
-                    pass
-            if _stream_context:
-                try:
-                    await _stream_context.__aexit__(None, None, None)
-                except Exception:
-                    pass
-            _session = None
-            _stream_context = None
-            _read_stream = None
-            _write_stream = None
-            _session_mcp_url = None
-            _session_api_key = None
-            raise
     
-    return _session
+    headers = {
+        "X-API-Key": key,
+        "Accept": "text/event-stream",
+    }
+    
+    # Use proper async with to ensure enter/exit in same task
+    async with sse_client(url, headers=headers) as (read_stream, write_stream, _):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            yield session
 
 
-async def list_mcp_tools(mcp_url: Optional[str] = None, api_key: Optional[str] = None):
+async def list_mcp_tools_async(mcp_url: Optional[str] = None, api_key: Optional[str] = None):
     """List all available MCP tools."""
-    session = await get_mcp_session(mcp_url=mcp_url, api_key=api_key)
-    tools_result = await session.list_tools()
-    return tools_result.tools
+    async with mcp_session(mcp_url=mcp_url, api_key=api_key) as session:
+        tools_result = await session.list_tools()
+        return tools_result.tools
 
 
-def create_langchain_tool_from_mcp(mcp_tool) -> StructuredTool:
+async def call_mcp_tool_async(tool_name: str, arguments: Dict[str, Any], 
+                               mcp_url: Optional[str] = None, api_key: Optional[str] = None) -> str:
+    """Call an MCP tool and return the result."""
+    async with mcp_session(mcp_url=mcp_url, api_key=api_key) as session:
+        result = await session.call_tool(tool_name, arguments=arguments)
+        
+        # Extract text content from result
+        if result.content and len(result.content) > 0:
+            if hasattr(result.content[0], 'text'):
+                return result.content[0].text
+            elif isinstance(result.content[0], str):
+                return result.content[0]
+            else:
+                return str(result.content[0])
+        return str(result)
+
+
+# Cache for tool definitions to avoid reconnecting for every tool call
+_cached_tools: Optional[List] = None
+_cached_url: Optional[str] = None
+_cached_key: Optional[str] = None
+
+
+def create_langchain_tool_from_mcp(mcp_tool, mcp_url: str, api_key: str) -> StructuredTool:
     """Create a LangChain StructuredTool from an MCP tool definition."""
     
-    # Extract tool metadata
     tool_name = mcp_tool.name
     tool_description = mcp_tool.description or f"Tool: {tool_name}"
     
@@ -153,7 +123,6 @@ def create_langchain_tool_from_mcp(mcp_tool) -> StructuredTool:
         required = schema.get("required", [])
         
         if properties:
-            # Create a dynamic Pydantic model with actual parameter names
             annotations = {}
             field_defaults = {}
             
@@ -183,7 +152,6 @@ def create_langchain_tool_from_mcp(mcp_tool) -> StructuredTool:
                     annotations[prop_name] = Optional[python_type]
                     field_defaults[prop_name] = Field(default=None, description=prop_desc)
             
-            # Create the model class dynamically
             ToolArgsModel = type(
                 f"{tool_name}Args",
                 (BaseModel,),
@@ -195,19 +163,19 @@ def create_langchain_tool_from_mcp(mcp_tool) -> StructuredTool:
             )
             args_schema = ToolArgsModel
     
-    # Create the tool implementation
+    # Capture mcp_url and api_key in closure
+    _url = mcp_url
+    _key = api_key
+    
     if args_schema:
-        # Tool with specific parameters
         def tool_implementation(**kwargs) -> str:
             """Implementation that calls the MCP tool."""
             try:
                 tool_args = {k: v for k, v in kwargs.items() if v is not None}
-                # Run on worker loop so cleanup runs in async context
-                return _run_on_mcp_loop(_call_tool_and_close(tool_name, tool_args))
+                return _run_on_mcp_loop(call_mcp_tool_async(tool_name, tool_args, _url, _key))
             except Exception as e:
                 return f"Error calling tool {tool_name}: {str(e)}"
     else:
-        # Fallback: generic dict-based tool
         class GenericArgs(BaseModel):
             arguments: Dict[str, Any] = Field(
                 description=f"Arguments for {tool_name} as a dictionary"
@@ -217,11 +185,10 @@ def create_langchain_tool_from_mcp(mcp_tool) -> StructuredTool:
         def tool_implementation(arguments: Dict[str, Any]) -> str:
             """Implementation that calls the MCP tool."""
             try:
-                return _run_on_mcp_loop(_call_tool_and_close(tool_name, arguments))
+                return _run_on_mcp_loop(call_mcp_tool_async(tool_name, arguments, _url, _key))
             except Exception as e:
                 return f"Error calling tool {tool_name}: {str(e)}"
     
-    # Create the LangChain tool
     return StructuredTool(
         name=tool_name,
         description=tool_description,
@@ -230,35 +197,19 @@ def create_langchain_tool_from_mcp(mcp_tool) -> StructuredTool:
     )
 
 
-async def _call_mcp_tool_async(tool_name: str, arguments: Dict[str, Any]) -> str:
-    """Async helper to call MCP tool."""
-    session = await get_mcp_session()
-    result = await session.call_tool(tool_name, arguments=arguments)
-    
-    # Extract text content from result
-    if result.content and len(result.content) > 0:
-        if hasattr(result.content[0], 'text'):
-            return result.content[0].text
-        elif isinstance(result.content[0], str):
-            return result.content[0]
-        else:
-            return str(result.content[0])
-    return str(result)
-
-
-async def _call_tool_and_close(tool_name: str, arguments: Dict[str, Any]) -> str:
-    """Call MCP tool. Session is kept open to avoid anyio TaskGroup teardown bugs on every call."""
-    return await _call_mcp_tool_async(tool_name, arguments)
-
-
-async def get_langchain_tools(mcp_url: Optional[str] = None, api_key: Optional[str] = None) -> List[StructuredTool]:
+async def get_langchain_tools_async(mcp_url: Optional[str] = None, api_key: Optional[str] = None) -> List[StructuredTool]:
     """Get all MCP tools wrapped as LangChain tools."""
-    mcp_tools = await list_mcp_tools(mcp_url=mcp_url, api_key=api_key)
+    global _cached_tools, _cached_url, _cached_key
+    
+    url = mcp_url if mcp_url is not None else _get_default_mcp_url()
+    key = api_key if api_key is not None else _get_default_mcp_api_key()
+    
+    mcp_tools = await list_mcp_tools_async(mcp_url=url, api_key=key)
     langchain_tools = []
     
     for mcp_tool in mcp_tools:
         try:
-            langchain_tool = create_langchain_tool_from_mcp(mcp_tool)
+            langchain_tool = create_langchain_tool_from_mcp(mcp_tool, url, key)
             langchain_tools.append(langchain_tool)
         except Exception as e:
             print(f"Warning: Failed to create LangChain tool for {mcp_tool.name}: {e}")
@@ -267,62 +218,37 @@ async def get_langchain_tools(mcp_url: Optional[str] = None, api_key: Optional[s
     return langchain_tools
 
 
-def _reset_mcp_session():
-    """Reset global MCP session so next call creates a fresh connection."""
-    global _session, _stream_context, _read_stream, _write_stream, _session_mcp_url, _session_api_key
-    _session = None
-    _stream_context = None
-    _read_stream = None
-    _write_stream = None
-    _session_mcp_url = None
-    _session_api_key = None
-
-
 def get_langchain_tools_sync(
     mcp_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> List[StructuredTool]:
-    """Synchronous wrapper to get LangChain tools. Runs on MCP worker loop so cleanup sees async context.
-    Config priority: passed params > .env > defaults."""
+    """Synchronous wrapper to get LangChain tools."""
     resolved_url = mcp_url if mcp_url is not None else _get_default_mcp_url()
-
-    async def _fetch_tools() -> List[StructuredTool]:
-        return await get_langchain_tools(mcp_url=mcp_url, api_key=api_key)
 
     max_attempts = 3
     last_error = None
+    
     for attempt in range(max_attempts):
         try:
-            return _run_on_mcp_loop(_fetch_tools())
-        except asyncio.CancelledError:
-            _reset_mcp_session()
-            last_error = "cancelled"
-            if attempt < max_attempts - 1:
-                import time
-                time.sleep(0.5)
-                continue
-            raise ValueError(
-                "MCP connection was cancelled. Make sure the MCP server is running at "
-                f"{resolved_url} and try again."
-            )
+            return _run_on_mcp_loop(get_langchain_tools_async(mcp_url=mcp_url, api_key=api_key))
         except Exception as e:
             last_error = e
             err_msg = str(e)
             err_type = type(e).__name__
-            # Known transient errors: retry with session reset
+            
+            # Known transient errors: retry
             is_transient = (
-                "WouldBlock" in err_type
-                or "EndOfStream" in err_type
+                "TaskGroup" in err_msg
+                or "cancel" in err_msg.lower()
                 or "_exceptions" in err_msg
-                or "TaskGroup" in err_msg
-                or isinstance(e, AttributeError)
+                or "ExceptionGroup" in err_type
             )
-            if is_transient:
-                _reset_mcp_session()
-                if attempt < max_attempts - 1:
-                    import time
-                    time.sleep(0.5)
-                    continue
+            
+            if is_transient and attempt < max_attempts - 1:
+                import time
+                time.sleep(0.5)
+                continue
+            
             raise ValueError(
                 f"Failed to connect to MCP server at {resolved_url}: {e}. "
                 "Ensure the MCP server is running and reachable."
@@ -332,26 +258,3 @@ def get_langchain_tools_sync(
         f"Could not load MCP tools after {max_attempts} attempts. Last error: {last_error}. "
         f"Is the MCP server running at {resolved_url}?"
     )
-
-
-async def close_session():
-    """Close the MCP session and stream context while event loop is still running (avoids AsyncLibraryNotFoundError on teardown).
-    Catches anyio/asyncio TaskGroup '_exceptions' AttributeError during teardown and still clears state."""
-    global _session, _stream_context, _read_stream, _write_stream
-    try:
-        if _session:
-            await _session.__aexit__(None, None, None)
-            _session = None
-        if _stream_context:
-            await _stream_context.__aexit__(None, None, None)
-            _stream_context = None
-    except AttributeError as e:
-        # anyio asyncio backend bug: TaskGroup has no attribute '_exceptions' during __aexit__
-        if "_exceptions" in str(e):
-            _session = None
-            _stream_context = None
-        else:
-            raise
-    finally:
-        _read_stream = None
-        _write_stream = None
