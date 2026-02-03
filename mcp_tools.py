@@ -10,7 +10,7 @@ from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from mcp import ClientSession
-from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
@@ -69,11 +69,10 @@ async def mcp_session(mcp_url: Optional[str] = None, api_key: Optional[str] = No
     
     headers = {
         "X-API-Key": key,
-        "Accept": "text/event-stream",
     }
     
-    # Use proper async with to ensure enter/exit in same task
-    async with sse_client(url, headers=headers) as (read_stream, write_stream, _):
+    # Use streamable HTTP transport (same as working simple_mcp_client); SSE fails behind proxies
+    async with streamablehttp_client(url=url, headers=headers) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             yield session
