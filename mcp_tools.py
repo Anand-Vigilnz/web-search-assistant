@@ -25,7 +25,7 @@ load_dotenv()
 
 # Default MCP connection configuration (env > defaults)
 def _get_default_mcp_url() -> str:
-    return os.getenv("MCP_URL", "https://devws.vigilnz.com/sse")
+    return os.getenv("MCP_URL", "https://devddg.vigilnz.com/sse")
 
 
 def _get_default_mcp_api_key() -> str:
@@ -93,47 +93,40 @@ async def get_mcp_session(mcp_url: Optional[str] = None, api_key: Optional[str] 
         _session_api_key = key
         headers = {
             "X-API-Key": key,
+            "Accept": "text/event-stream",
         }
         
-        # Try SSE client first for /sse endpoints, then fall back to streamable HTTP
+        # Try SSE client for /sse endpoints, streamable HTTP otherwise
         use_sse = url.rstrip('/').endswith('/sse')
-        clients_to_try = [sse_client, streamablehttp_client] if use_sse else [streamablehttp_client, sse_client]
-        last_error = None
         
-        for client_factory in clients_to_try:
-            try:
-                _stream_context = client_factory(url, headers=headers)
-                _read_stream, _write_stream, _ = await _stream_context.__aenter__()
-                _session = ClientSession(_read_stream, _write_stream)
-                await _session.__aenter__()
-                await _session.initialize()
-                return _session
-            except Exception as e:
-                last_error = e
-                # Clean up partial state before trying next client
-                if _session:
-                    try:
-                        await _session.__aexit__(None, None, None)
-                    except Exception:
-                        pass
-                if _stream_context:
-                    try:
-                        await _stream_context.__aexit__(None, None, None)
-                    except Exception:
-                        pass
-                _session = None
-                _stream_context = None
-                _read_stream = None
-                _write_stream = None
-                # Continue to try next client
-                continue
-        
-        # All clients failed - reset state and raise last error
-        _session_mcp_url = None
-        _session_api_key = None
-        if last_error:
-            raise last_error
-        raise RuntimeError("Failed to connect with any MCP transport")
+        try:
+            if use_sse:
+                _stream_context = sse_client(url, headers=headers)
+            else:
+                _stream_context = streamablehttp_client(url, headers=headers)
+            _read_stream, _write_stream, _ = await _stream_context.__aenter__()
+            _session = ClientSession(_read_stream, _write_stream)
+            await _session.__aenter__()
+            await _session.initialize()
+        except Exception as e:
+            # Clean up partial state
+            if _session:
+                try:
+                    await _session.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            if _stream_context:
+                try:
+                    await _stream_context.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            _session = None
+            _stream_context = None
+            _read_stream = None
+            _write_stream = None
+            _session_mcp_url = None
+            _session_api_key = None
+            raise
     
     return _session
 
