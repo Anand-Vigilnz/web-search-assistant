@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY agent.py .
 COPY mcp_tools.py .
-
+COPY .env .
 # Streamlit runs on 8501 by default
 EXPOSE 8501
 
