@@ -10,3 +10,4 @@ simple_mcp_client.py
 .venv
 .env
 atlassian_mcp_client.py
+Test_openai.py

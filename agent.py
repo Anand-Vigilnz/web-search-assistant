@@ -43,7 +43,7 @@ def get_llm_and_tools(
         )
 
     llm = ChatOpenAI(
-        model="gpt-4o-mini",
+        model="gpt-5-nano",
         api_key=resolved_openai_key,
         temperature=0.7,
     )

@@ -1,6 +1,6 @@
 # MCP Agent Chatbot
 
-Streamlit chatbot powered by LangChain, OpenAI (gpt-4o-mini), and MCP tools.
+Streamlit chatbot powered by LangChain, OpenAI (gpt-5-nano), and MCP tools.
 
 ## Setup
 

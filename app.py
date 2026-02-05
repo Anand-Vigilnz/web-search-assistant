@@ -62,13 +62,6 @@ with st.sidebar:
         key="vigilnz_api_key",
         placeholder="From .env if not set",
     )
-    st.text_input(
-        "OPENAI API KEY",
-        value=os.getenv("OPENAI_API_KEY", ""),
-        type="password",
-        key="openai_api_key",
-        placeholder="From .env if not set",
-    )
     st.header("Controls")
     if st.button("Clear Chat History"):
         st.session_state.messages = []
@@ -79,8 +72,7 @@ with st.sidebar:
         st.rerun()
 
 # Title
-st.title("🤖 MCP Agent Chatbot")
-st.caption("Powered by LangChain, OpenAI (gpt-4o-mini), and MCP tools")
+st.title("🤖 ToolGuard Demo App")
 
 # Display chat history
 for message in st.session_state.messages:
